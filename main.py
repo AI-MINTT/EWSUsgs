@@ -1,0 +1,175 @@
+"""
+EWS Risk Service — USGS-backed, drop-in replacement for EWSStub.
+
+The original EWSStub returned deterministic hash-based scores. This version
+sources real earthquake data from the USGS FDSN Web Service
+(`https://earthquake.usgs.gov/fdsnws/event/1/`) and derives a risk score from
+the recent seismicity around the queried point. The contract is identical to
+EWSStub so the RiskAndHazardML inference client needs no changes.
+
+Contract (mirrors `inference-contracts/output-schema.md`):
+    GET /api/v1/risk/point?lat=<float>&lon=<float>
+    -> 200 { "data": {
+            "composite": float in [0, 1],
+            "confidence": float in [0, 1],
+            "exposure": float in [0, 1],
+            "vulnerability": float in [0, 1],
+            "kecamatan_code": str | null,
+            "assessed_at": iso8601,
+            "notes": list[str]
+        } }
+
+Scoring (intentionally simple, see planning note in docs/ews-scoring.md):
+    - Pull all M>=2.5 earthquakes in the last 30 days, within 300 km of the
+      point. USGS FDSN keeps this fast and free.
+    - composite = clamp(0.6 * mag_factor + 0.4 * proximity_factor, 0, 1)
+        mag_factor      = min(1, max_magnitude / 8.0)
+        proximity_factor = min(1, 1 / (1 + min_distance_km / 50))
+    - exposure = clamp(event_count / 30, 0, 1)
+    - vulnerability = 0.5 (placeholder; can be replaced with BNPB InaRisk data
+      later when the proper layer id is identified)
+    - confidence = 0.7 if any events else 0.4 (low but not zero — USGS outage
+      is possible)
+    - kecamatan_code: deterministic pseudo-id from (lat, lon) until the BNPB
+      boundary layer is wired. Carries a "USGS" prefix so downstream code can
+      tell it isn't a real administrative code.
+"""
+from __future__ import annotations
+
+import hashlib
+import math
+import time
+from datetime import datetime, timezone, timedelta
+
+import httpx
+from fastapi import FastAPI, HTTPException, Query
+
+app = FastAPI(title="EWS Risk (USGS)", version="0.2.0-usgs")
+
+USGS_BASE = "https://earthquake.usgs.gov/fdsnws/event/1/query"
+WINDOW_DAYS = 30
+RADIUS_KM = 300.0
+MIN_MAGNITUDE = 2.5
+HTTP_TIMEOUT_S = 8.0
+
+_started_at = time.time()
+
+
+def _hash_id(*nums: float, prefix: str = "USGS") -> str:
+    """Stable pseudo-id for kecamatan_code when no boundary lookup is wired."""
+    h = hashlib.sha256("|".join(f"{n:.4f}" for n in nums).encode()).hexdigest()
+    return prefix + h[:10].upper()
+
+
+def _score(events: list[dict], lat: float, lon: float) -> dict:
+    if not events:
+        return {
+            "composite": 0.0,
+            "confidence": 0.4,
+            "exposure": 0.0,
+            "vulnerability": 0.5,
+            "kecamatan_code": _hash_id(lat, lon),
+            "assessed_at": datetime.now(timezone.utc).isoformat(),
+            "notes": [
+                "no recent M>=2.5 earthquakes within 300 km / 30 days",
+                f"lat={lat:.4f} lon={lon:.4f}",
+            ],
+        }
+
+    max_mag = max(e["magnitude"] for e in events)
+    min_dist = min(e["distance_km"] for e in events)
+
+    mag_factor = min(1.0, max_mag / 8.0)
+    proximity_factor = 1.0 / (1.0 + min_dist / 50.0)
+    composite = max(0.0, min(1.0, 0.6 * mag_factor + 0.4 * proximity_factor))
+
+    exposure = min(1.0, len(events) / 30.0)
+
+    # Confidence: scale with sample size. Past 10 events, fully confident; under
+    # 3, halve the confidence to flag the score as data-poor.
+    confidence = min(1.0, 0.3 + 0.07 * len(events))
+
+    return {
+        "composite": round(composite, 6),
+        "confidence": round(confidence, 4),
+        "exposure": round(exposure, 4),
+        "vulnerability": 0.5,
+        "kecamatan_code": _hash_id(lat, lon),
+        "assessed_at": datetime.now(timezone.utc).isoformat(),
+        "notes": [
+            f"USGS FDSN: {len(events)} events, max M{max_mag:.1f}, "
+            f"nearest {min_dist:.0f} km",
+            f"lat={lat:.4f} lon={lon:.4f}",
+        ],
+    }
+
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    r = 6371.0
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def _fetch_usgs(lat: float, lon: float) -> list[dict]:
+    """Returns list of {magnitude, distance_km, place, time} dicts."""
+    start = (datetime.now(timezone.utc) - timedelta(days=WINDOW_DAYS)).strftime("%Y-%m-%d")
+    params = {
+        "format": "geojson",
+        "starttime": start,
+        "latitude": lat,
+        "longitude": lon,
+        "maxradiuskm": RADIUS_KM,
+        "minmagnitude": MIN_MAGNITUDE,
+        "limit": 200,
+        "orderby": "magnitude",
+    }
+    try:
+        with httpx.Client(timeout=HTTP_TIMEOUT_S) as client:
+            r = client.get(USGS_BASE, params=params)
+            r.raise_for_status()
+            payload = r.json()
+    except (httpx.HTTPError, ValueError) as e:
+        raise HTTPException(status_code=502, detail=f"USGS upstream error: {e}") from e
+
+    features = payload.get("features") or []
+    out: list[dict] = []
+    for f in features:
+        try:
+            mag = float(f["properties"]["mag"])
+            lon_eq, lat_eq, depth_km = f["geometry"]["coordinates"]
+        except (KeyError, ValueError, TypeError):
+            continue
+        if mag is None or lat_eq is None or lon_eq is None:
+            continue
+        out.append({
+            "magnitude": mag,
+            "distance_km": _haversine_km(lat, lon, lat_eq, lon_eq),
+            "place": f["properties"].get("place", ""),
+            "time": f["properties"].get("time"),
+        })
+    return out
+
+
+@app.get("/api/v1/risk/point")
+def risk_point(
+    lat: float = Query(..., ge=-90, le=90),
+    lon: float = Query(..., ge=-180, le=180),
+) -> dict:
+    if math.isnan(lat) or math.isnan(lon) or math.isinf(lat) or math.isinf(lon):
+        raise HTTPException(status_code=400, detail="lat/lon must be finite")
+    events = _fetch_usgs(lat, lon)
+    return {"data": _score(events, lat, lon)}
+
+
+@app.get("/health")
+def health() -> dict:
+    return {
+        "status": "ok",
+        "service": "ews-usgs",
+        "version": app.version,
+        "uptime_seconds": int(time.time() - _started_at),
+    }
