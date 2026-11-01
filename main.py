@@ -19,20 +19,27 @@ Contract (mirrors `inference-contracts/output-schema.md`):
             "notes": list[str]
         } }
 
-Scoring (intentionally simple, see planning note in docs/ews-scoring.md):
-    - Pull all M>=2.5 earthquakes in the last 30 days, within 300 km of the
-      point. USGS FDSN keeps this fast and free.
+Scoring (intentionally simple; this docstring is the reference):
+    - Pull the 200 largest M>=2.5 earthquakes within 300 km of the point,
+      from 00:00 UTC 30 days ago (so a 30-31 day window). USGS FDSN keeps
+      this fast and free.
     - composite = clamp(0.6 * mag_factor + 0.4 * proximity_factor, 0, 1)
         mag_factor      = min(1, max_magnitude / 8.0)
         proximity_factor = min(1, 1 / (1 + min_distance_km / 50))
     - exposure = clamp(event_count / 30, 0, 1)
     - vulnerability = 0.5 (placeholder; can be replaced with BNPB InaRisk data
       later when the proper layer id is identified)
-    - confidence = 0.7 if any events else 0.4 (low but not zero — USGS outage
-      is possible)
+    - confidence = 0.4 if no events, else min(1, 0.3 + 0.07 * event_count),
+      which reaches 1.0 at 10 events. One event gives 0.37, slightly below
+      the no-event value.
     - kecamatan_code: deterministic pseudo-id from (lat, lon) until the BNPB
       boundary layer is wired. Carries a "USGS" prefix so downstream code can
       tell it isn't a real administrative code.
+
+Upstream handling:
+    - USGS results are cached per point for 60 s (bounded at 1024 points).
+    - Timeouts, network errors and 5xx are retried once within a 12 s budget.
+    - Any failed or malformed USGS response returns 502, never a zero score.
 """
 from __future__ import annotations
 
@@ -116,7 +123,8 @@ def _score(events: list[dict], lat: float, lon: float) -> dict:
             "kecamatan_code": _hash_id(lat, lon),
             "assessed_at": datetime.now(UTC).isoformat(),
             "notes": [
-                "no recent M>=2.5 earthquakes within 300 km / 30 days",
+                f"no recent M>={MIN_MAGNITUDE} earthquakes within "
+                f"{RADIUS_KM:.0f} km / {WINDOW_DAYS} days",
                 f"lat={lat:.4f} lon={lon:.4f}",
             ],
         }
@@ -130,8 +138,7 @@ def _score(events: list[dict], lat: float, lon: float) -> dict:
 
     exposure = min(1.0, len(events) / 30.0)
 
-    # Confidence: scale with sample size. Past 10 events, fully confident; under
-    # 3, halve the confidence to flag the score as data-poor.
+    # Confidence: scale with sample size; fully confident from 10 events.
     confidence = min(1.0, 0.3 + 0.07 * len(events))
 
     notes = [
