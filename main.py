@@ -37,6 +37,7 @@ Scoring (intentionally simple, see planning note in docs/ews-scoring.md):
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 import time
 from datetime import datetime, timezone, timedelta
@@ -45,6 +46,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query
 
 app = FastAPI(title="EWS Risk (USGS)", version="0.2.0-usgs")
+log = logging.getLogger("ews_usgs")
 
 USGS_BASE = "https://earthquake.usgs.gov/fdsnws/event/1/query"
 WINDOW_DAYS = 30
@@ -132,8 +134,19 @@ def _fetch_usgs(lat: float, lon: float) -> list[dict]:
             r = client.get(USGS_BASE, params=params)
             r.raise_for_status()
             payload = r.json()
+    except httpx.HTTPStatusError as e:
+        # The gateway forwards our error body verbatim, so keep the upstream
+        # URL and exception text in our log rather than in the response.
+        log.warning("USGS returned HTTP %s", e.response.status_code)
+        raise HTTPException(
+            status_code=502,
+            detail=f"USGS upstream error: HTTP {e.response.status_code}",
+        ) from e
     except (httpx.HTTPError, ValueError) as e:
-        raise HTTPException(status_code=502, detail=f"USGS upstream error: {e}") from e
+        log.warning("USGS request failed: %r", e)
+        raise HTTPException(
+            status_code=502, detail=f"USGS upstream error: {type(e).__name__}"
+        ) from e
 
     features = payload.get("features") or []
     out: list[dict] = []
