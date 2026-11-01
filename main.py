@@ -54,6 +54,13 @@ WINDOW_DAYS = 30
 RADIUS_KM = 300.0
 MIN_MAGNITUDE = 2.5
 HTTP_TIMEOUT_S = 8.0
+# The gateway waits 15 s for this service (Ews:TimeoutSeconds), so all USGS
+# attempts plus backoff must fit in this budget.
+HTTP_BUDGET_S = 12.0
+HTTP_ATTEMPTS = 2
+RETRY_BACKOFF_S = 1.0
+# 429 is deliberately not retried: USGS is asking clients to slow down.
+RETRY_STATUS = frozenset({500, 502, 503, 504})
 # Identical points are answered from memory for this long, so a dashboard that
 # polls one point does not turn into one USGS query per request.
 CACHE_TTL_S = 60.0
@@ -151,6 +158,36 @@ def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return 2 * r * math.asin(math.sqrt(a))
 
 
+def _get_usgs_json(params: dict[str, str | int | float]) -> object:
+    """GET the FDSN query; one retry with backoff on timeouts, network errors
+    and 5xx, as long as a useful attempt still fits in HTTP_BUDGET_S."""
+    deadline = time.monotonic() + HTTP_BUDGET_S
+    attempt = 1
+    while True:
+        try:
+            r = _client.get(
+                USGS_BASE,
+                params=params,
+                timeout=min(HTTP_TIMEOUT_S, deadline - time.monotonic()),
+            )
+            r.raise_for_status()
+            return r.json()
+        except (httpx.TransportError, httpx.HTTPStatusError) as e:
+            transient = isinstance(e, httpx.TransportError) or (
+                e.response.status_code in RETRY_STATUS
+            )
+            backoff = RETRY_BACKOFF_S * attempt
+            if (
+                not transient
+                or attempt >= HTTP_ATTEMPTS
+                or deadline - time.monotonic() < backoff + 2.0
+            ):
+                raise
+            log.warning("USGS attempt %d failed (%r), retrying", attempt, e)
+            time.sleep(backoff)
+            attempt += 1
+
+
 def _fetch_usgs(lat: float, lon: float) -> list[dict]:
     """Returns list of {magnitude, distance_km, place, time} dicts.
 
@@ -173,9 +210,7 @@ def _fetch_usgs(lat: float, lon: float) -> list[dict]:
         "orderby": "magnitude",
     }
     try:
-        r = _client.get(USGS_BASE, params=params)
-        r.raise_for_status()
-        payload = r.json()
+        payload = _get_usgs_json(params)
     except httpx.HTTPStatusError as e:
         # The gateway forwards our error body verbatim, so keep the upstream
         # URL and exception text in our log rather than in the response.
