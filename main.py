@@ -39,6 +39,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
+import threading
 import time
 from datetime import datetime, timezone, timedelta
 
@@ -53,8 +54,42 @@ WINDOW_DAYS = 30
 RADIUS_KM = 300.0
 MIN_MAGNITUDE = 2.5
 HTTP_TIMEOUT_S = 8.0
+# Identical points are answered from memory for this long, so a dashboard that
+# polls one point does not turn into one USGS query per request.
+CACHE_TTL_S = 60.0
+CACHE_MAX_ENTRIES = 1024
 
 _started_at = time.time()
+# One pooled client per process instead of a new TLS connection per request.
+_client = httpx.Client(
+    timeout=HTTP_TIMEOUT_S,
+    headers={"User-Agent": f"AI-MINT-EWSUsgs/{app.version}"},
+)
+_cache: dict[tuple[float, float], tuple[float, list[dict]]] = {}
+_cache_lock = threading.Lock()
+
+
+def _cache_get(key: tuple[float, float]) -> list[dict] | None:
+    with _cache_lock:
+        hit = _cache.get(key)
+    if hit is None or time.monotonic() - hit[0] >= CACHE_TTL_S:
+        return None
+    return hit[1]
+
+
+def _cache_put(key: tuple[float, float], events: list[dict]) -> None:
+    now = time.monotonic()
+    with _cache_lock:
+        _cache.pop(key, None)
+        if len(_cache) >= CACHE_MAX_ENTRIES:
+            # Expired entries first, then the oldest, so a caller cycling
+            # through distinct points cannot grow memory without bound.
+            expired = [k for k, (t, _) in _cache.items() if now - t >= CACHE_TTL_S]
+            for k in expired:
+                del _cache[k]
+            while len(_cache) >= CACHE_MAX_ENTRIES:
+                del _cache[next(iter(_cache))]
+        _cache[key] = (now, events)
 
 
 def _hash_id(*nums: float, prefix: str = "USGS") -> str:
@@ -117,7 +152,15 @@ def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 def _fetch_usgs(lat: float, lon: float) -> list[dict]:
-    """Returns list of {magnitude, distance_km, place, time} dicts."""
+    """Returns list of {magnitude, distance_km, place, time} dicts.
+
+    Results are cached per point (rounded to 4 decimals, ~11 m) for
+    CACHE_TTL_S; errors are not cached.
+    """
+    key = (round(lat, 4), round(lon, 4))
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
     start = (datetime.now(timezone.utc) - timedelta(days=WINDOW_DAYS)).strftime("%Y-%m-%d")
     params = {
         "format": "geojson",
@@ -130,10 +173,9 @@ def _fetch_usgs(lat: float, lon: float) -> list[dict]:
         "orderby": "magnitude",
     }
     try:
-        with httpx.Client(timeout=HTTP_TIMEOUT_S) as client:
-            r = client.get(USGS_BASE, params=params)
-            r.raise_for_status()
-            payload = r.json()
+        r = _client.get(USGS_BASE, params=params)
+        r.raise_for_status()
+        payload = r.json()
     except httpx.HTTPStatusError as e:
         # The gateway forwards our error body verbatim, so keep the upstream
         # URL and exception text in our log rather than in the response.
@@ -173,6 +215,7 @@ def _fetch_usgs(lat: float, lon: float) -> list[dict]:
             "place": f["properties"].get("place", ""),
             "time": f["properties"].get("time"),
         })
+    _cache_put(key, out)
     return out
 
 
