@@ -41,7 +41,7 @@ import logging
 import math
 import threading
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import UTC, datetime, timedelta
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query
@@ -106,7 +106,7 @@ def _score(events: list[dict], lat: float, lon: float) -> dict:
             "exposure": 0.0,
             "vulnerability": 0.5,
             "kecamatan_code": _hash_id(lat, lon),
-            "assessed_at": datetime.now(timezone.utc).isoformat(),
+            "assessed_at": datetime.now(UTC).isoformat(),
             "notes": [
                 "no recent M>=2.5 earthquakes within 300 km / 30 days",
                 f"lat={lat:.4f} lon={lon:.4f}",
@@ -132,7 +132,7 @@ def _score(events: list[dict], lat: float, lon: float) -> dict:
         "exposure": round(exposure, 4),
         "vulnerability": 0.5,
         "kecamatan_code": _hash_id(lat, lon),
-        "assessed_at": datetime.now(timezone.utc).isoformat(),
+        "assessed_at": datetime.now(UTC).isoformat(),
         "notes": [
             f"USGS FDSN: {len(events)} events, max M{max_mag:.1f}, "
             f"nearest {min_dist:.0f} km",
@@ -161,8 +161,8 @@ def _fetch_usgs(lat: float, lon: float) -> list[dict]:
     cached = _cache_get(key)
     if cached is not None:
         return cached
-    start = (datetime.now(timezone.utc) - timedelta(days=WINDOW_DAYS)).strftime("%Y-%m-%d")
-    params = {
+    start = (datetime.now(UTC) - timedelta(days=WINDOW_DAYS)).strftime("%Y-%m-%d")
+    params: dict[str, str | int | float] = {
         "format": "geojson",
         "starttime": start,
         "latitude": lat,
