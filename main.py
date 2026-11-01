@@ -148,15 +148,24 @@ def _fetch_usgs(lat: float, lon: float) -> list[dict]:
             status_code=502, detail=f"USGS upstream error: {type(e).__name__}"
         ) from e
 
-    features = payload.get("features") or []
+    # A body without a "features" list is not "no earthquakes": scoring it as
+    # an empty list would publish a false all-clear (composite 0.0).
+    features = payload.get("features") if isinstance(payload, dict) else None
+    if not isinstance(features, list):
+        log.warning("USGS response is not a GeoJSON FeatureCollection")
+        raise HTTPException(
+            status_code=502, detail="USGS upstream error: malformed GeoJSON"
+        )
     out: list[dict] = []
     for f in features:
         try:
             mag = float(f["properties"]["mag"])
-            lon_eq, lat_eq, depth_km = f["geometry"]["coordinates"]
-        except (KeyError, ValueError, TypeError):
+            # GeoJSON order is [lon, lat, depth_km]; depth is not scored.
+            coords = f["geometry"]["coordinates"]
+            lon_eq, lat_eq = float(coords[0]), float(coords[1])
+        except (KeyError, IndexError, ValueError, TypeError):
             continue
-        if mag is None or lat_eq is None or lon_eq is None:
+        if not all(math.isfinite(v) for v in (mag, lat_eq, lon_eq)):
             continue
         out.append({
             "magnitude": mag,
