@@ -53,6 +53,7 @@ USGS_BASE = "https://earthquake.usgs.gov/fdsnws/event/1/query"
 WINDOW_DAYS = 30
 RADIUS_KM = 300.0
 MIN_MAGNITUDE = 2.5
+QUERY_LIMIT = 200
 HTTP_TIMEOUT_S = 8.0
 # The gateway waits 15 s for this service (Ews:TimeoutSeconds), so all USGS
 # attempts plus backoff must fit in this budget.
@@ -133,6 +134,19 @@ def _score(events: list[dict], lat: float, lon: float) -> dict:
     # 3, halve the confidence to flag the score as data-poor.
     confidence = min(1.0, 0.3 + 0.07 * len(events))
 
+    notes = [
+        f"USGS FDSN: {len(events)} events, max M{max_mag:.1f}, "
+        f"nearest {min_dist:.0f} km",
+        f"lat={lat:.4f} lon={lon:.4f}",
+    ]
+    if len(events) >= QUERY_LIMIT:
+        # USGS returns the largest events first, so in a dense sequence the
+        # nearest small event can fall outside the page.
+        notes.append(
+            f"USGS query limit of {QUERY_LIMIT} events reached; "
+            "nearest distance may be overstated"
+        )
+
     return {
         "composite": round(composite, 6),
         "confidence": round(confidence, 4),
@@ -140,11 +154,7 @@ def _score(events: list[dict], lat: float, lon: float) -> dict:
         "vulnerability": 0.5,
         "kecamatan_code": _hash_id(lat, lon),
         "assessed_at": datetime.now(UTC).isoformat(),
-        "notes": [
-            f"USGS FDSN: {len(events)} events, max M{max_mag:.1f}, "
-            f"nearest {min_dist:.0f} km",
-            f"lat={lat:.4f} lon={lon:.4f}",
-        ],
+        "notes": notes,
     }
 
 
@@ -206,7 +216,7 @@ def _fetch_usgs(lat: float, lon: float) -> list[dict]:
         "longitude": lon,
         "maxradiuskm": RADIUS_KM,
         "minmagnitude": MIN_MAGNITUDE,
-        "limit": 200,
+        "limit": QUERY_LIMIT,
         "orderby": "magnitude",
     }
     try:
