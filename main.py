@@ -132,8 +132,8 @@ def _score(events: list[dict], lat: float, lon: float) -> dict:
             ],
         }
 
-    max_mag = max(e["magnitude"] for e in events)
-    min_dist = min(e["distance_km"] for e in events)
+    max_mag = float(max(e["magnitude"] for e in events))
+    min_dist = float(min(e["distance_km"] for e in events))
 
     mag_factor = min(1.0, max_mag / 8.0)
     proximity_factor = 1.0 / (1.0 + min_dist / 50.0)
