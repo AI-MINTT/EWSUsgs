@@ -123,8 +123,10 @@ def _score(events: list[dict], lat: float, lon: float) -> dict:
             "kecamatan_code": _hash_id(lat, lon),
             "assessed_at": datetime.now(UTC).isoformat(),
             "notes": [
-                f"no recent M>={MIN_MAGNITUDE} earthquakes within "
-                f"{RADIUS_KM:.0f} km / {WINDOW_DAYS} days",
+                (
+                    f"no recent M>={MIN_MAGNITUDE} earthquakes within "
+                    f"{RADIUS_KM:.0f} km / {WINDOW_DAYS} days"
+                ),
                 f"lat={lat:.4f} lon={lon:.4f}",
             ],
         }
@@ -142,8 +144,10 @@ def _score(events: list[dict], lat: float, lon: float) -> dict:
     confidence = min(1.0, 0.3 + 0.07 * len(events))
 
     notes = [
-        f"USGS FDSN: {len(events)} events, max M{max_mag:.1f}, "
-        f"nearest {min_dist:.0f} km",
+        (
+            f"USGS FDSN: {len(events)} events, max M{max_mag:.1f}, "
+            f"nearest {min_dist:.0f} km"
+        ),
         f"lat={lat:.4f} lon={lon:.4f}",
     ]
     if len(events) >= QUERY_LIMIT:
