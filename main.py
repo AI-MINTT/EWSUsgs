@@ -49,6 +49,7 @@ import math
 import threading
 import time
 from datetime import UTC, datetime, timedelta
+from typing import Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query
@@ -84,7 +85,7 @@ _cache: dict[tuple[float, float], tuple[float, list[dict]]] = {}
 _cache_lock = threading.Lock()
 
 
-def _cache_get(key: tuple[float, float]) -> list[dict] | None:
+def _cache_get(key: tuple[float, float]) -> Optional[list[dict]]:  # noqa: UP045 - Qodana's default Python level rejects X | None
     with _cache_lock:
         hit = _cache.get(key)
     if hit is None or time.monotonic() - hit[0] >= CACHE_TTL_S:
